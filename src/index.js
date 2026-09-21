@@ -8,6 +8,47 @@ import { uvPath } from "@titaniumnetwork-dev/ultraviolet";
 import { epoxyPath } from "@mercuryworkshop/epoxy-transport";
 import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
 
+// ---- Content filter ----
+// Every site the proxy visits is looked up through Cloudflare for Families
+// (1.1.1.3), which blocks adult content and known malware/phishing sites.
+import dns from "node:dns";
+import net from "node:net";
+
+const FILTER_DNS = ["1.1.1.3", "1.0.0.3"];
+const filterResolver = new dns.Resolver();
+filterResolver.setServers(FILTER_DNS);
+dns.promises.setServers(FILTER_DNS);
+
+const originalLookup = dns.lookup;
+dns.lookup = function (hostname, options, callback) {
+	if (typeof options === "function") {
+		callback = options;
+		options = {};
+	}
+	if (typeof options === "number") options = { family: options };
+	options = options || {};
+
+	if (!hostname || net.isIP(hostname) || hostname === "localhost") {
+		return originalLookup(hostname, options, callback);
+	}
+
+	filterResolver.resolve4(hostname, (err, addrs) => {
+		if (err || !addrs || addrs.length === 0) {
+			return callback(err || Object.assign(new Error("Not found"), { code: "ENOTFOUND" }));
+		}
+		if (addrs.every((a) => a === "0.0.0.0")) {
+			return callback(
+				Object.assign(new Error("Blocked by content filter: " + hostname), { code: "ENOTFOUND" })
+			);
+		}
+		if (options.all) {
+			return callback(null, addrs.map((a) => ({ address: a, family: 4 })));
+		}
+		callback(null, addrs[0], 4);
+	});
+};
+// ---- End content filter ----
+
 const app = express();
 // Load our publicPath first and prioritize it over UV.
 app.use(express.static("./public"));
@@ -34,7 +75,7 @@ server.on("upgrade", (req, socket, head) => {
 	if (req.url.endsWith("/wisp/")) {
 		wisp.routeRequest(req, socket, head);
 		return;
-	} 
+	}
 	socket.end();
 });
 
@@ -44,9 +85,6 @@ if (isNaN(port)) port = 8080;
 
 server.on("listening", () => {
 	const address = server.address();
-
-	// by default we are listening on 0.0.0.0 (every interface)
-	// we just need to list a few
 	console.log("Listening on:");
 	console.log(`\thttp://localhost:${address.port}`);
 	console.log(`\thttp://${hostname()}:${address.port}`);
